@@ -94,8 +94,12 @@ CCs set parameters (0-127, scaled to 0-255):
     CC 2   speed
     CC 3   depth
     CC 4   warmth
-    CC 5   crossfade time into the next preset, and the ease on a note
-           release. Global by default — see GLOBAL_CC — so one envelope
+    CC 5   crossfade time, both directions
+    CC 20  crossfade IN only — the attack
+    CC 21  crossfade OUT only — the release.
+           Per-channel, so the candles and the pars fade independently.
+           A channel you have not automated sits at the default, not at
+           whatever some other channel happened to be doing. Global by default — see GLOBAL_CC — so one envelope
            covers every channel. Targets start at DEFAULT_FADE, so a
            channel with no envelope still eases rather than snapping.
     CC 12  hue OFFSET from the note's palette colour. 64 is the centre.
@@ -174,7 +178,18 @@ DEFAULT_FADE = 15
 #   {CC_FADE}                       one fade envelope drives everything
 #   {CC_FADE, CC_SPEED, CC_DEPTH}   share the movement, keep master separate
 #   set()                           strictly per-channel, as before
-GLOBAL_CC = {5}         # CC_FADE, spelled out because it is defined later
+# EMPTY on purpose. A global CC overwrites every target, which is fine until
+# you want the candles and the pars fading differently — then it is a wall.
+#
+# The problem globals were added to solve was a channel that had never been
+# sent a CC sitting on its birth default while the rest of the rig moved on.
+# NOTE_REFRESHES_CC below handles that properly: an untouched channel inherits
+# the newest value seen anywhere, and a channel with its own value keeps it.
+# That gives inheritance without taking independence away.
+#
+# Put a CC number in here only if you want it truly locked across every
+# target, with no way to differ.
+GLOBAL_CC = set()
 
 # Hue and saturation offsets are CCs, so they persist until something moves
 # them — including across a gap where nothing is held. Leave a sweep sitting
@@ -190,7 +205,53 @@ GLOBAL_CC = {5}         # CC_FADE, spelled out because it is defined later
 # notes — would be thrown away at the first gap and not restated until the
 # envelope moved again. Sticky offsets are the lesser problem: end a sweep at
 # 64 and it behaves.
+# Two separate switches, because the two moments carry different risk.
+#
+# ON_START is safe and on. Locating into a section inherits whatever offset
+# was last sent, which is never what you want when you jump around a set.
+#
+# ON_BLACKOUT is off, and should probably stay off. MIDI carries no clip
+# boundary, so "a new clip with no CC 12 automation" and "a gap in the notes
+# inside the clip I am already in" look identical on the wire. Resetting at
+# blackout catches the first and destroys the second — an offset you set
+# deliberately over a part would vanish the moment the notes stopped, and
+# Live would not restate a flat envelope to bring it back.
+#
+# The reliable fix for clip-to-clip bleed is a CC 12 and CC 13 point at the
+# START of each clip. candelabra_template.mid seeds both at 64 for exactly
+# this reason — build clips from it and the problem does not arise.
+RESET_OFFSETS_ON_START    = True
 RESET_OFFSETS_ON_BLACKOUT = False
+
+# CCs are per-target, which means a channel that has never been sent one keeps
+# whatever it was born with — while the channel you HAVE been driving sits at
+# something else entirely. Play a note on the quiet one and it comes out at a
+# stale value nobody chose.
+#
+# With this on, a note-on resets any CC that target has never been sent back
+# to its resting default. A target that HAS received a CC is left alone — an
+# explicit value always wins.
+#
+# This also cleans up after go_idle, which writes speed, depth and warmth
+# directly without any CC involved. Without the reset those idle values sit
+# there afterwards and a channel plays at numbers nobody chose.
+NOTE_REFRESHES_CC = True
+
+# Where an unset CC lands.
+#   False  its resting default — predictable, and what the log will show
+#   True   the newest value seen for that CC on ANY channel
+#
+# Inheritance sounds helpful and reads as a haunting: a value you set on one
+# channel turns up on another you never touched, and the log gives you no
+# clue where it came from.
+INHERIT_UNSET_CC = False
+
+# The most recent value seen for each CC, on any channel.
+cc_seen = {}
+
+# Where a CC rests when nothing has ever set it. Matches State.__init__.
+CC_RESTING = {"level": 255, "speed": 170, "depth": 220,
+              "warmth": 0, "fade": 15, "fade_out": 15, "boost": 0}
 IDLE_AFTER  = 5.0       # seconds of total MIDI silence before idling anyway
 
 # ---------------------------------------------------------------- note map
@@ -261,6 +322,20 @@ def note_to_look(note):
 # in the spec, so nothing touches it unasked.
 CC_MASTER = 14
 CC_SPEED, CC_DEPTH, CC_WARMTH, CC_FADE = 2, 3, 4, 5
+
+# Fades are asymmetric in practice: a release usually wants longer than an
+# attack. Three CCs, in order of specificity —
+#
+#   CC 5    both directions at once, the general one
+#   CC 20   the attack only, into a lit preset
+#   CC 21   the release only, out to blackout
+#
+# CC 5 writes both fields, so send it alone for symmetric fades, or send it
+# first and then override one side. The packet still carries a single T; the
+# bridge picks which of the two to send based on where the target is heading,
+# so none of this needs a firmware change.
+CC_FADE_IN  = 20
+CC_FADE_OUT = 21
 CC_BOOST = 15      # also undefined in the spec
 # Hue and saturation used to sit on CC 6 and 7. Don't put them back there:
 # CC 6 is Data Entry MSB and CC 7 is Channel Volume, both reserved, and Live
@@ -281,7 +356,8 @@ CC_FIELD = {
     CC_SPEED:  "speed",
     CC_DEPTH:  "depth",
     CC_WARMTH: "warmth",
-    CC_FADE:   "fade",
+    CC_FADE_IN:  "fade",
+    CC_FADE_OUT: "fade_out",
     CC_BOOST:  "boost",
 }
 
@@ -369,7 +445,8 @@ class State:
         self.speed   = 170
         self.depth   = 220
         self.warmth  = 0
-        self.fade    = DEFAULT_FADE
+        self.fade     = DEFAULT_FADE     # into a lit preset
+        self.fade_out = DEFAULT_FADE     # out to blackout
         # go_idle borrows `fade` for its slow ease. Stash the real value so
         # resolve() can hand it back.
         self._fade_held = DEFAULT_FADE
@@ -387,6 +464,10 @@ class State:
         # output. Carried as a fifth palette value or ridden on CC 15.
         self.boost   = 0
         self.dirty   = True   # something changed since last send
+
+        # CC numbers this target has actually been sent, as opposed to the
+        # ones it is merely sitting on. See NOTE_REFRESHES_CC.
+        self.cc_explicit = set()
 
         # note -> velocity, in the order they were pressed
         self.held    = {}
@@ -459,9 +540,12 @@ class State:
         """This state's values under some other fixture code. Link mode uses
         it to send a candelabra's look to a par group without either State
         having to know about the other."""
+        # One T on the wire, chosen by direction. Heading to blackout is a
+        # release; anything else is an attack.
+        t = self.fade_out if self.preset == 0 else self.fade
         return (f"F{fixture} P{self.preset} M{self.master} "
                 f"S{self.speed} D{self.depth} W{self.warmth} "
-                f"T{self.fade} H{self.hue} C{self.sat} B{self.boost}\n")
+                f"T{t} H{self.hue} C{self.sat} B{self.boost}\n")
 
     def line(self):
         return self.line_as(self.fixture)
@@ -594,7 +678,14 @@ def main():
                         # Locating into the middle of a set inherits whatever
                         # offsets were last sent. Centre them so a clip starts
                         # from its palette colours.
-                        if RESET_OFFSETS_ON_BLACKOUT:
+                        # Every claim drops too. A CC sent an hour ago on some
+                        # other clip should not still own a channel — without
+                        # this, one stray value marks that target explicit for
+                        # the life of the process and the refresh skips it
+                        # forever, with nothing in the log to say why.
+                        for s_ in states.values():
+                            s_.cc_explicit.clear()
+                        if RESET_OFFSETS_ON_START:
                             for s_ in states.values():
                                 s_.hue_off = 0
                                 s_.sat_off = 0
@@ -618,6 +709,21 @@ def main():
                         st = states[target]
 
                     if msg.type == "note_on" and msg.velocity > 0:
+                        # Before anything else, pull in any CC this target
+                        # has never been sent. Without it a channel plays at
+                        # whatever it was born with while the rest of the rig
+                        # has moved on.
+                        if NOTE_REFRESHES_CC:
+                            for num, fld in CC_FIELD.items():
+                                if num in st.cc_explicit:
+                                    continue
+                                v = (cc_seen.get(num, CC_RESTING.get(fld))
+                                     if INHERIT_UNSET_CC
+                                     else CC_RESTING.get(fld))
+                                if v is not None and getattr(st, fld) != v:
+                                    setattr(st, fld, v)
+                                    st.dirty = True
+
                         look = note_to_look(msg.note)
 
                         # The link key. Black, so note_to_look ignores it and
@@ -640,7 +746,11 @@ def main():
                                 print(f"  on  [{TARGET_NAMES[target]}] "
                                       f"{msg.note} -> "
                                       f"{PRESET_NAMES[look[0]]} oct{oct_} "
-                                      f"H{st.hue} C{st.sat} @ {st.master}")
+                                      f"H{st.hue} C{st.sat} @ {st.master}"
+                                      # master is three things multiplied, so
+                                      # a zero tells you nothing on its own.
+                                      f"  (lvl {st.level} vel {st.vel} "
+                                      f"ceil {st.pmaster})")
 
                     elif (msg.type == "note_off" or
                           (msg.type == "note_on" and msg.velocity == 0)):
@@ -665,14 +775,19 @@ def main():
                             # Bipolar. 64 is the centre and leaves the note's
                             # palette colour untouched.
                             if msg.control == CC_HUE:
-                                field, val = "hue_off", (msg.value - 64) * 2
+                                fields, val = ["hue_off"], (msg.value - 64) * 2
                             else:
-                                field, val = "sat_off", (msg.value - 64) * 4
+                                fields, val = ["sat_off"], (msg.value - 64) * 4
+                        elif msg.control == CC_FADE:
+                            # The general one. Writes both directions, and
+                            # claims 20 and 21 too so a later note-on refresh
+                            # does not quietly undo it.
+                            fields, val = ["fade", "fade_out"], scale(msg.value)
                         else:
-                            field = CC_FIELD.get(msg.control)
-                            if field is None:
+                            f = CC_FIELD.get(msg.control)
+                            if f is None:
                                 continue
-                            val = scale(msg.value)
+                            fields, val = [f], scale(msg.value)
 
                         # A CC that repeats its current value changes nothing,
                         # and Live emits plenty of those. Sending them anyway
@@ -680,12 +795,24 @@ def main():
                         # the log.
                         # A global CC lands on every target at once, so one
                         # envelope can drive the whole rig.
+                        cc_seen[msg.control] = val
+                        claims = ({CC_FADE, CC_FADE_IN, CC_FADE_OUT}
+                                  if msg.control == CC_FADE else {msg.control})
+                        if not args.quiet:
+                            # Which CC, from where, to what. Without this an
+                            # unexpected value in an outgoing line gives no
+                            # clue whether a clip sent it or it was inherited.
+                            print(f"  cc  [{TARGET_NAMES[target]}] "
+                                  f"{msg.control} = {msg.value} "
+                                  f"-> {'/'.join(fields)} {val}")
                         for tgt in (states.values() if msg.control in GLOBAL_CC
                                     else (st,)):
-                            if getattr(tgt, field) == val:
-                                continue
-                            setattr(tgt, field, val)
-                            tgt.dirty = True
+                            tgt.cc_explicit |= claims
+                            for field in fields:
+                                if getattr(tgt, field) == val:
+                                    continue
+                                setattr(tgt, field, val)
+                                tgt.dirty = True
 
                 # ---- nothing from Ableton for a while: idle.
                 # A held note fires one note-on and then nothing, so held
