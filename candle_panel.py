@@ -65,19 +65,19 @@ FIXTURES = [
 PRESETS = [("blackout", 0), ("steady", 1), ("flicker", 2), ("gust", 3),
            ("ember", 4), ("pulse", 5), ("strobe", 6)]
 
-# name -> (hue, sat, warmth, master_ceiling, boost)
+# octave, name, hue, sat, warmth, master_ceiling, boost
 PALETTES = [
-    ("deep ember",   20, 234, 255,  27,   0),
-    ("candle flame",  0,   0,   0, 255,   0),
-    ("red",         255, 255,   0, 255,   0),
-    ("orange",       17, 255,   0, 255,   0),
-    ("yellow",       34, 255,   0, 255,   0),
-    ("green",        73, 242,   0, 255,   0),
-    ("cyan",        125, 236,   0, 255,   0),
-    ("blue",        160, 255,   0, 255,   0),
-    ("violet",      186, 252,   0, 255,   0),
-    ("magenta",     223, 255,   0, 255,   0),
-    ("full white",    0,   0,   0, 255, 255),
+    (-2, "deep ember",   20, 234, 255,  27,   0),
+    (-1, "candle flame", 56, 133,   0, 255,  14),
+    ( 0, "red",         255, 255,   0, 255,   0),
+    ( 1, "orange",       17, 255,   0, 255,   0),
+    ( 2, "yellow",       34, 255,   0, 255,   0),
+    ( 3, "green",        73, 242,   0, 255,   0),
+    ( 4, "cyan",        125, 236,   0, 255,   0),
+    ( 5, "blue",        160, 255,   0, 255,   0),
+    ( 6, "violet",      186, 252,   0, 255,   0),
+    ( 7, "magenta",     223, 255,   0, 255,   0),
+    ( 8, "full white",    0,   0,   0, 255, 255),
 ]
 
 SLIDERS = [
@@ -85,7 +85,8 @@ SLIDERS = [
     ("speed",  "S", 0, 255, 170),
     ("depth",  "D", 0, 255, 220),
     ("warmth", "W", 0, 255,   0),
-    ("fade",   "T", 0, 255,   0),
+    ("fade",   "T", 0, 255,  15),
+    ("fadeout","O", 0, 255,  15),
     ("hue",    "H", 0, 255,   0),
     ("sat",    "C", 0, 255,   0),
     ("boost",  "B", 0, 255,   0),
@@ -95,16 +96,18 @@ SLIDERS = [
 # amber, no output trim. Useful as an A/B — it is what the par looked like
 # when it read stark and white beside a candle.
 UNTRIMMED = {"ww": 1.00, "wa": 0.00, "gt": 0.88, "tf": 1.00,
-             "tc": 1.00, "dg": 1.00}
+             "tc": 1.00, "dg": 1.00, "ba": 1.00, "tk": 1.00}
 
 # label, serial key, over-the-air fixture code, lo, hi, default
 TUNING = [
-    ("ww  white die share",  "ww", 90, 0.0, 1.0, 0.621),
+    ("ww  white die share",  "ww", 90, 0.0, 1.0, 0.603),
     ("wa  amber share",      "wa", 91, 0.0, 1.0, 0.974),
-    ("gt  green trim",       "gt", 92, 0.5, 1.0, 0.88),
-    ("tf  flame trim",       "tf", 93, 0.0, 1.0, 0.293),
+    ("gt  green trim",       "gt", 92, 0.5, 1.0, 0.897),
+    ("tf  flame trim",       "tf", 93, 0.0, 1.0, 0.241),
     ("tc  colour trim",      "tc", 94, 0.0, 1.0, 1.000),
-    ("dg  dimmer curve",     "dg", 95, 0.3, 1.0, 0.469),
+    ("dg  dimmer curve",     "dg", 95, 0.3, 1.0, 0.710),
+    ("ba  amber in boost",   "ba", 96, 0.0, 1.0, 0.300),
+    ("tk  trim curve",       "tk", 97, 0.5, 4.0, 1.000),
 ]
 
 
@@ -196,6 +199,9 @@ class Panel:
         # it. Deep ember is inherently dim wherever it is played, and the
         # fader keeps whatever you set it to.
         self.pmaster = tk.IntVar(value=255)
+        # Which palette entry the sliders are currently editing, so its
+        # tweaked values can be copied back out in source form.
+        self.cur_pal = -1
         self.tune = {k: tk.DoubleVar(value=d) for _, k, _, _, _, d in TUNING}
         # Trims can go over the air through the transmitter, which means the
         # node does not need its own cable. Fixture codes 90-93 carry the
@@ -321,11 +327,17 @@ class Panel:
 
         pl = ttk.LabelFrame(right, text="palette")
         pl.pack(fill="x")
-        for name, h, s, w, m, b in PALETTES:
+        for oc, name, h, s, w, m, b in PALETTES:
             ttk.Button(pl, text=name, width=16,
-                       command=lambda h=h, s=s, w=w, m=m, b=b:
-                           self.palette(h, s, w, m, b)
+                       command=lambda o=oc, h=h, s=s, w=w, m=m, b=b:
+                           self.palette(o, h, s, w, m, b)
                        ).pack(padx=4, pady=1)
+        ttk.Label(pl, text="click one, tweak hue / sat / warmth,",
+                  foreground="#777").pack(anchor="w", padx=4)
+        ttk.Label(pl, text="then copy it back as source:",
+                  foreground="#777").pack(anchor="w", padx=4)
+        ttk.Button(pl, text="copy palette line", command=self.copy_palette
+                   ).pack(padx=4, pady=(2, 5))
 
         tn = ttk.LabelFrame(right, text="par node tuning")
         tn.pack(fill="x", pady=(8, 0))
@@ -410,7 +422,8 @@ class Panel:
         v = self.vals
         return (f"F{fixture} P{self.preset.get()} M{self.master_out()} "
                 f"S{v['speed'].get()} D{v['depth'].get()} W{v['warmth'].get()} "
-                f"T{v['fade'].get()} H{v['hue'].get()} C{v['sat'].get()} "
+                f"T{v['fadeout'].get() if self.preset.get() == 0 else v['fade'].get()} "
+                f"H{v['hue'].get()} C{v['sat'].get()} "
                 f"B{v['boost'].get()}")
 
     def send_now(self):
@@ -546,7 +559,32 @@ class Panel:
         for _label, key, code, _lo, _hi, _d in TUNING:
             self.tune_send(key, code)
 
-    def palette(self, h, s, w, m, b):
+    def copy_palette(self):
+        """The current hue / sat / warmth / ceiling / boost, formatted for
+        both PALETTES tables. Tweak on the sliders, then paste these in."""
+        oc = self.cur_pal
+        name = next((n for o, n, *_ in PALETTES if o == oc), "?")
+        h = self.vals["hue"].get()
+        s = self.vals["sat"].get()
+        w = self.vals["warmth"].get()
+        m = self.pmaster.get()
+        b = self.vals["boost"].get()
+
+        tail = ""
+        if m != 255 or b:
+            tail = f", {m:3d}, {b:3d}" if b else f", {m:3d}"
+        bridge = f"    {oc:2d}: ({h:3d}, {s:3d}, {w:3d}{tail}),   # {name}"
+        panel = (f'    ({oc:2d}, "{name}", {h:3d}, {s:3d}, '
+                 f'{w:3d}, {m:3d}, {b:3d}),')
+
+        out = f"candle_bridge.py PALETTES:\n{bridge}\n\n" \
+              f"candle_panel.py PALETTES:\n{panel}"
+        self.root.clipboard_clear()
+        self.root.clipboard_append(out)
+        self.logq.put(f"copied palette {name}:  hue {h}  sat {s}  warmth {w}"
+                      f"  ceiling {m}  boost {b}")
+
+    def palette(self, oc, h, s, w, m, b):
         # Every palette sets every field it owns, so clicking one never
         # inherits a leftover from the last.
         self.vals["hue"].set(h)
@@ -554,6 +592,7 @@ class Panel:
         self.vals["warmth"].set(w)
         self.vals["boost"].set(b)
         self.pmaster.set(m)
+        self.cur_pal = oc
         self.mark()
 
     def defaults(self):

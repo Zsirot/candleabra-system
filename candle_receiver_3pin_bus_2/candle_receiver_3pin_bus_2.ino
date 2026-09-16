@@ -126,6 +126,12 @@ struct Candle {
   float         gustDepth = 0;
   unsigned long lastStep  = 0;
   unsigned long phaseOff  = 0;   // desync pulse slightly between candles
+
+  // The brightness actually emitted last frame, and the value a crossfade
+  // starts from. A fade must begin where the output IS, not where the
+  // outgoing preset's envelope happens to be sitting.
+  float         lastB     = 0;
+  float         fadeFrom  = 0;
 };
 
 Candle cd[NUM_PIXELS];
@@ -385,6 +391,10 @@ static void applyPacket(const CandlePacket& p, uint8_t mask) {
     c.boost  = p.boost;
 
     if (p.preset != c.preset && p.preset < P_COUNT) {
+      // Catch the fade where the output actually is. Interrupt a slow fade-in
+      // with a short note and the old code restarted from the outgoing preset
+      // at full — a jump to peak before the fade out even began.
+      c.fadeFrom   = c.lastB;
       c.prevPreset = c.preset;
       c.preset     = p.preset;
       c.fadeLen    = (unsigned long)p.fade * 10;
@@ -484,15 +494,15 @@ void loop() {
         c.fadeLen = 0;
       } else {
         float blend = (float)elapsed / (float)c.fadeLen;
-        // renderCandle mutates flame state, so evaluate the outgoing look
-        // on a scratch copy rather than advancing the random walk twice.
-        Candle tmp = c;
-        float prev = renderCandle(tmp, c.prevPreset);
-        b = prev * (1.0 - blend) + b * blend;
+        // From where the output was, to the incoming preset live. No need to
+        // re-render the outgoing one, which also means no scratch copy and no
+        // risk of advancing a random walk twice in a frame.
+        b = c.fadeFrom * (1.0 - blend) + b * blend;
       }
     }
 
     // dimmer reads redder, the way real flame does
+    c.lastB = b;
     float w = (c.warmth / 255.0) * (1.0 - b * 0.35) + (1.0 - b) * 0.2;
     setCandle(i, flameColor(c, b, w));
   }

@@ -19,17 +19,45 @@ MAPPING
 -------
 
 MIDI channel picks what the message addresses:
-    ch 1   both candelabras
-    ch 2   candelabra A          ch 3   candelabra B
-    ch 4   A candle 1            ch 7   B candle 1
-    ch 5   A candle 2            ch 8   B candle 2
-    ch 6   A candle 3            ch 9   B candle 3
+    ch 1   both candelabras      F0
+    ch 2   candelabra A          F1
+    ch 3   candelabra B          F2
+    ch 4   all four pars         F40
+    ch 5   pars 1 and 2          F45
+    ch 6   pars 3 and 4          F46
+    ch 7   pars 1 and 4, inside  F47
+    ch 8   pars 2 and 3, outside F48
 
-Each target keeps its own held notes and its own parameters. A group
-command and a per-candle command simply overwrite whatever they address —
-last received wins, with no priority and no modal state. In practice that
-means: end a channel 1 note before a per-candle section starts, and don't
-restart it until those notes have released.
+Each target keeps its own held notes and its own parameters. Two commands
+that address the same fixture simply overwrite each other — last received
+wins, with no priority and no modal state. Channels 4 and 7 both reach par
+1, so end one before the other starts.
+
+LINK MODE. Holding one particular black key on a par channel makes that
+group follow a candelabra exactly, for as long as it is held:
+
+    ch 4 follows ch 1, 2 or 3 — whichever last changed
+    ch 5 follows ch 1 or 2       ch 7 follows ch 1
+    ch 6 follows ch 1 or 3       ch 8 follows ch 1
+
+Listing ch 1 alongside the specific source is what makes a link still work
+when both candelabras are driven together rather than separately.
+
+Release and the group snaps back to whatever its own channel had become in
+the meantime — its state never stopped tracking underneath. That makes the
+release a handoff rather than a reset.
+
+To link permanently instead, with no key to play, put the par codes in
+LINK_ALWAYS below, or pass --link for all four. Their own channels then do
+nothing, which is the trade.
+
+F0 addresses the candles ONLY. If it also reached the pars, channel 1 would
+drive them directly and a link note on channel 4 would mean nothing. F40 is
+the par equivalent wherever "everything" is wanted.
+
+The idle look — transport stopped, or five seconds of MIDI silence — is the
+C-1 candle flame with a gust on it. It reads its colour from the palette, so
+retuning the flame retunes idle as well.
 
 Notes pick the preset AND the colour. They are GATED, not latched: the
 look is active for as long as the note is held, and releasing it returns
@@ -66,8 +94,13 @@ CCs set parameters (0-127, scaled to 0-255):
     CC 2   speed
     CC 3   depth
     CC 4   warmth
-    CC 5   crossfade time into the next preset
-    CC 12  hue OFFSET from the note's palette colour. 64 is the centre
+    CC 5   crossfade time into the next preset, and the ease on a note
+           release. Global by default — see GLOBAL_CC — so one envelope
+           covers every channel. Targets start at DEFAULT_FADE, so a
+           channel with no envelope still eases rather than snapping.
+    CC 12  hue OFFSET from the note's palette colour. 64 is the centre.
+           Offsets reset to centre whenever a target falls to blackout and
+           on transport start — see RESET_OFFSETS_ON_BLACKOUT
            and changes nothing; 0 and 127 are half a wheel either way.
     CC 15  white boost. 0 is the flame as always, 127 lights all four
            dies at full. The only route to maximum output.
@@ -122,9 +155,42 @@ IDLE_PRESET = 3         # gust
 IDLE_MASTER = 255
 IDLE_SPEED  = 170
 IDLE_DEPTH  = 220
-IDLE_WARMTH = 0
-IDLE_SAT    = 0         # idle is always real candle colour
+# Idle takes its COLOUR from a palette entry rather than carrying its own
+# copy, so tuning the flame tunes the idle look with it. Movement — preset,
+# master, speed, depth, fade — stays separate below, because idle wants to
+# drift more than a played note does.
+IDLE_OCTAVE = -1        # C-1, the candle flame
 IDLE_FADE   = 80        # 0.8s ease into the idle look
+
+# Every target starts here, so a channel with no CC 5 envelope still eases
+# rather than snapping. Units of 10ms — 15 is 150ms, enough to take the edge
+# off a note release without smearing a cue. 0 restores the old hard cut.
+DEFAULT_FADE = 15
+
+# CCs that apply to EVERY target, whichever channel they arrive on. Without
+# this, an envelope drawn on channel 1 sets the fade for F0 alone and the
+# other channels keep their defaults — which is the usual reason one channel
+# eases and another snaps.
+#   {CC_FADE}                       one fade envelope drives everything
+#   {CC_FADE, CC_SPEED, CC_DEPTH}   share the movement, keep master separate
+#   set()                           strictly per-channel, as before
+GLOBAL_CC = {5}         # CC_FADE, spelled out because it is defined later
+
+# Hue and saturation offsets are CCs, so they persist until something moves
+# them — including across a gap where nothing is held. Leave a sweep sitting
+# at 90 and every note after it is shifted a quarter turn, until a later clip
+# happens to send CC 12 again.
+#
+# With this on, a target that falls to blackout clears its offsets, so the
+# next note starts from its palette colour.
+#
+# OFF by default, because the reset loses more than it fixes. Live only emits
+# a CC when its value CHANGES, so an offset held deliberately across a section
+# — a whole part sitting a quarter turn round the wheel, with gaps between the
+# notes — would be thrown away at the first gap and not restated until the
+# envelope moved again. Sticky offsets are the lesser problem: end a sweep at
+# 64 and it behaves.
+RESET_OFFSETS_ON_BLACKOUT = False
 IDLE_AFTER  = 5.0       # seconds of total MIDI silence before idling anyway
 
 # ---------------------------------------------------------------- note map
@@ -156,7 +222,12 @@ PALETTES = {
     #  master is optional, defaults to 255. Use it when an octave should
     #  always play dim no matter how hard the note is struck.
     -2: ( 20, 234, 255,  27),   # C-2  deep ember
-    -1: (  0,   0,   0),   # C-1  HOME - true candle flame
+    # C-1  HOME - candle flame. Tuned by eye rather than derived: hue 56
+    # sits between yellow and green, blended halfway into the blackbody
+    # curve, with a little boost to lift the whole thing. Note the sat of
+    # 133 — the flame is no longer a low-saturation look, which matters for
+    # the par's trim curve. See trimCurve in par_node.ino.
+    -1: ( 56, 133,   0, 255,  14),
      0: (255, 255,   0),   # C0   red      (hue 255 wraps to 0)
      1: ( 17, 255,   0),   # C1   orange
      2: ( 34, 255,   0),   # C2   yellow
@@ -229,13 +300,50 @@ def scale(v):
 # Each target keeps its own held notes and its own parameters, so a group
 # command and a per-candle command simply overwrite whatever they address.
 # Last received wins.
-CHAN_TARGET = {0: 0, 1: 1, 2: 2,
-               3: 11, 4: 12, 5: 13,
-               6: 21, 7: 22, 8: 23}
+CHAN_TARGET = {0: 0,  1: 1,  2: 2,
+               3: 40, 4: 45, 5: 46, 6: 47, 7: 48}
 
 TARGET_NAMES = {0: "all", 1: "A", 2: "B",
-                11: "A1", 12: "A2", 13: "A3",
-                21: "B1", 22: "B2", 23: "B3"}
+                40: "pars", 45: "pars12", 46: "pars34",
+                47: "inside", 48: "outside"}
+
+# F40 is the par equivalent of F0 — needed anywhere the code idles or blacks
+# out "everything", since F0 no longer reaches the pars.
+PAR_ALL = 40
+
+# ---- link mode
+# One black key, held on a par channel, makes that group follow a candelabra
+# target until it is released. Matched by pitch class, so any octave works
+# and it plays the same wherever your hand happens to be.
+LINK_NOTE_CLASS = 1        # 1 = C#, 3 = D#, 6 = F#, 8 = G#, 10 = A#
+
+# par fixture code -> the targets it follows while the key is held.
+# Several sources per group is allowed: channel 4 mirrors whichever of the
+# three candelabra channels last changed, so it works whether you are driving
+# both together on ch 1 or A and B separately on ch 2 and ch 3.
+# Every group lists ch 1 as well as its specific source, so a link still does
+# something when both candelabras are being driven together from ch 1 rather
+# than separately from ch 2 and ch 3.
+LINK_SOURCE = {40: (0, 1, 2),      # all pars   <- ch 1, 2 or 3
+               45: (0, 1),         # pars 1+2   <- ch 1 or 2
+               46: (0, 2),         # pars 3+4   <- ch 1 or 3
+               47: (0,),           # inside     <- ch 1
+               48: (0,)}           # outside    <- ch 1
+
+# par fixture code -> set of link notes currently held for it
+link_held = {}
+
+# Groups that are linked permanently, with no key held. Put a par code in
+# here and it follows its LINK_SOURCE for the whole session — every note,
+# every CC, on channels 1, 2 and 3, with nothing to play and nothing to
+# forget. Its own channel then does nothing, which is the trade.
+#
+#   {40}          all four pars shadow the candelabras
+#   {45, 46}      each pair shadows its own candelabra
+#   set()         off, the C# key is the only way in
+#
+# --link on the command line is the same as {40}.
+LINK_ALWAYS = set()
 
 # Addresses nothing. The receivers stamp their watchdog before checking the
 # fixture code, so this proves the link is alive without changing any look.
@@ -261,7 +369,10 @@ class State:
         self.speed   = 170
         self.depth   = 220
         self.warmth  = 0
-        self.fade    = 0
+        self.fade    = DEFAULT_FADE
+        # go_idle borrows `fade` for its slow ease. Stash the real value so
+        # resolve() can hand it back.
+        self._fade_held = DEFAULT_FADE
         # Colour is the note's palette entry plus a signed offset from the
         # CC. The CC is bipolar: 64 is the centre and means "leave the
         # palette alone", below pushes one way, above the other. That way a
@@ -286,23 +397,35 @@ class State:
         if self.idling:
             return
         self.idling = True
+        self._fade_held = self.fade
         self.preset = IDLE_PRESET
         self.level   = IDLE_MASTER
         self.vel     = 255
         self.pmaster = 255
         self.speed  = IDLE_SPEED
         self.depth  = IDLE_DEPTH
-        self.warmth = IDLE_WARMTH
-        self.pal_sat = IDLE_SAT
+        # Colour straight from the palette. pal_hue used to be left at
+        # whatever was last played, which did not show while idle sat at
+        # saturation 0 but would the moment it did not.
+        entry = PALETTES[IDLE_OCTAVE]
+        self.pal_hue = entry[0]
+        self.pal_sat = entry[1]
+        self.warmth  = entry[2]
+        self.boost   = entry[4] if len(entry) > 4 else 0
         self.sat_off = 0
         self.hue_off = 0
-        self.boost   = 0
         self.fade   = IDLE_FADE
         self.dirty  = True
 
     def resolve(self, latch):
         """Preset and colour follow the most recently pressed note still
         held. Nothing held means blackout, unless we're latching."""
+        if self.idling:
+            # Coming out of the idle look. Put the fade back, or this target
+            # keeps an 800ms release for the rest of the session while every
+            # other one sits at DEFAULT_FADE — which is why channel 1 used to
+            # ease and channels 2 and 3 snapped.
+            self.fade = self._fade_held
         self.idling = False
         if self.held:
             note = list(self.held)[-1]
@@ -313,6 +436,11 @@ class State:
                 self.vel = scale(self.held[note])
         elif not latch:
             self.preset = 0        # blackout
+            if RESET_OFFSETS_ON_BLACKOUT:
+                # Back to the palette's own colour, so the next note is not
+                # wearing the last phrase's offset.
+                self.hue_off = 0
+                self.sat_off = 0
         self.dirty = True
 
     @property
@@ -327,10 +455,16 @@ class State:
     def sat(self):
         return max(0, min(255, self.pal_sat + self.sat_off))
 
-    def line(self):
-        return (f"F{self.fixture} P{self.preset} M{self.master} "
+    def line_as(self, fixture):
+        """This state's values under some other fixture code. Link mode uses
+        it to send a candelabra's look to a par group without either State
+        having to know about the other."""
+        return (f"F{fixture} P{self.preset} M{self.master} "
                 f"S{self.speed} D{self.depth} W{self.warmth} "
                 f"T{self.fade} H{self.hue} C{self.sat} B{self.boost}\n")
+
+    def line(self):
+        return self.line_as(self.fixture)
 
 
 # ------------------------------------------------------------------ ports
@@ -380,10 +514,15 @@ def main():
     ap.add_argument("--serial", help="serial device path")
     ap.add_argument("--list",   action="store_true")
     ap.add_argument("--quiet",  action="store_true", help="don't echo commands")
+    ap.add_argument("--link",   action="store_true",
+                    help="link all four pars to the candelabras permanently, "
+                         "as though the C# key were always held")
     ap.add_argument("--latch",  action="store_true",
                     help="notes stick until the next note, instead of "
                          "returning to blackout on note-off")
     args = ap.parse_args()
+    if args.link:
+        LINK_ALWAYS.add(40)
 
     if args.list:
         print("MIDI inputs:")
@@ -410,6 +549,9 @@ def main():
     last_midi = time.time()
     playing   = None       # None = unknown (no clock), True/False from transport
 
+    if LINK_ALWAYS:
+        names = ", ".join(TARGET_NAMES[t] for t in sorted(LINK_ALWAYS))
+        print(f"permanent link: {names}")
     print("bridge running.  ctrl-C to stop.\n")
 
     with mido.open_input(midi_name) as port:
@@ -429,6 +571,9 @@ def main():
                         # F0 addresses every candle, so one idle line resets
                         # anything a per-candle command left lit.
                         st_all.go_idle()
+                        # F0 no longer reaches the pars, so they need their own.
+                        states[PAR_ALL].go_idle()
+                        link_held.clear()
                         if not args.quiet:
                             print("  transport stop -> idle")
                         continue
@@ -443,6 +588,18 @@ def main():
                         # nothing. Restate everything we have so the fixtures
                         # are at least in a known state on every start.
                         st_all.dirty = True
+                        # Same for the pars. Clearing link_held means a link
+                        # can never survive a locate that skipped its note-off.
+                        link_held.clear()
+                        # Locating into the middle of a set inherits whatever
+                        # offsets were last sent. Centre them so a clip starts
+                        # from its palette colours.
+                        if RESET_OFFSETS_ON_BLACKOUT:
+                            for s_ in states.values():
+                                s_.hue_off = 0
+                                s_.sat_off = 0
+                        states[PAR_ALL].resolve(args.latch)
+                        states[PAR_ALL].dirty = True
                         last_send = 0.0        # force an immediate send
                         if not args.quiet:
                             print(f"  transport {msg.type} -> notes, resending state")
@@ -453,7 +610,7 @@ def main():
                         continue
 
                     # The channel picks which target this message addresses.
-                    # Anything outside ch 1-9 is ignored entirely.
+                    # Anything outside ch 1-8 is ignored entirely.
                     if msg.type in ("note_on", "note_off", "control_change"):
                         target = CHAN_TARGET.get(msg.channel)
                         if target is None:
@@ -462,6 +619,18 @@ def main():
 
                     if msg.type == "note_on" and msg.velocity > 0:
                         look = note_to_look(msg.note)
+
+                        # The link key. Black, so note_to_look ignores it and
+                        # it can never also be a preset.
+                        if ((msg.note % 12) == LINK_NOTE_CLASS
+                                and target in LINK_SOURCE):
+                            link_held.setdefault(target, set()).add(msg.note)
+                            if not args.quiet:
+                                src = "/".join(TARGET_NAMES[x]
+                                               for x in LINK_SOURCE[target])
+                                print(f"  link[{TARGET_NAMES[target]}] on "
+                                      f"-> follows {src}")
+
                         if look:
                             st.held.pop(msg.note, None)   # re-press moves it
                             st.held[msg.note] = msg.velocity
@@ -475,6 +644,14 @@ def main():
 
                     elif (msg.type == "note_off" or
                           (msg.type == "note_on" and msg.velocity == 0)):
+                        held_link = link_held.get(target)
+                        if held_link and msg.note in held_link:
+                            held_link.discard(msg.note)
+                            # Snap back to this group's own look on release.
+                            st.dirty = True
+                            if not args.quiet:
+                                print(f"  link[{TARGET_NAMES[target]}] off")
+
                         if msg.note in st.held:
                             del st.held[msg.note]
                             st.resolve(args.latch)
@@ -501,10 +678,14 @@ def main():
                         # and Live emits plenty of those. Sending them anyway
                         # floods the serial link and buries real changes in
                         # the log.
-                        if getattr(st, field) == val:
-                            continue
-                        setattr(st, field, val)
-                        st.dirty = True
+                        # A global CC lands on every target at once, so one
+                        # envelope can drive the whole rig.
+                        for tgt in (states.values() if msg.control in GLOBAL_CC
+                                    else (st,)):
+                            if getattr(tgt, field) == val:
+                                continue
+                            setattr(tgt, field, val)
+                            tgt.dirty = True
 
                 # ---- nothing from Ableton for a while: idle.
                 # A held note fires one note-on and then nothing, so held
@@ -522,14 +703,44 @@ def main():
                 now = time.time()
                 dirty = [s for s in send_order if s.dirty]
 
-                if dirty and (now - last_send) >= SEND_INTERVAL:
-                    # Every dirty target gets its own line. There are at most
-                    # nine, and only the ones that actually changed are sent.
+                # Which par groups are currently following a candelabra, and
+                # whether that source has anything new to say. Sampled before
+                # the loop below, which clears the dirty flags.
+                linked = LINK_ALWAYS | {t for t, n in link_held.items() if n}
+
+                # For each linked group, which of its sources has something
+                # new to say this pass. A group can list several; if more than
+                # one changed in the same window the last one listed wins,
+                # rather than sending two lines for the same fixture.
+                hot_src = {}
+                for t in linked:
+                    hot = [src for src in LINK_SOURCE[t] if states[src].dirty]
+                    if hot:
+                        hot_src[t] = hot[-1]
+
+                if (dirty or linked) and (now - last_send) >= SEND_INTERVAL:
+                    # Every dirty target gets its own line, and only the ones
+                    # that actually changed are sent.
                     for s in dirty:
+                        # A linked group is driven from its source just below,
+                        # so skip its own line or the two would fight.
+                        if s.fixture in linked:
+                            s.dirty = False
+                            continue
                         ser.write(s.line().encode())
                         if not args.quiet:
                             print("  " + s.line().strip())
                         s.dirty = False
+
+                    for t in sorted(linked):
+                        src = hot_src.get(t)
+                        if src is None:
+                            continue        # no source changed, nothing to say
+                        line = states[src].line_as(t)
+                        ser.write(line.encode())
+                        if not args.quiet:
+                            print("  " + line.strip() + "   (link)")
+
                     last_send = now
 
                 elif (now - last_send) >= HEARTBEAT:
@@ -546,6 +757,9 @@ def main():
             print("\nblackout, closing")
             st_all.preset, st_all.level, st_all.fade = 0, 0, 30
             ser.write(st_all.line().encode())
+            pa = states[PAR_ALL]
+            pa.preset, pa.level, pa.fade = 0, 0, 30
+            ser.write(pa.line().encode())
             time.sleep(0.2)
             ser.close()
 

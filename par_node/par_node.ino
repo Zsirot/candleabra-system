@@ -16,12 +16,14 @@
  *   F47           pars 1 and 4      (inside)
  *   F48           pars 2 and 3      (outside)
  *
- * TUNING OVER THE AIR. Fixture codes 90-95 carry a trim value in the master
+ * TUNING OVER THE AIR. Fixture codes 90-97 carry a trim value in the master
  * field, 0-255 mapped to 0.0-1.0. They set a variable and light nothing, so
  * they can be sent mid-look without disturbing anything.
  *   F90 M<v>   whiteW      F93 M<v>   trimFlame
  *   F91 M<v>   whiteA      F94 M<v>   trimColour
  *   F92 M<v>   greenTrim   F95 M<v>   dimGamma
+ *                           F96 M<v>   boostAmber
+ *                           F97 M<v>   trimCurve, 0-255 -> 0.5-4.0
  * The transmitter forwards any code it is given, so this needs no change
  * there. The candle receivers never match a code whose tens digit is 9.
  *
@@ -86,9 +88,41 @@ static const uint16_t PAR_ADDR[NUM_PARS] = { 1, 11, 21, 31 };   // A001 A011 A02
 #define FAILSAFE_DEPTH   220
 #define FAILSAFE_WARMTH    0
 
+/*
+ * The idle flame, matched to the C-1 candle palette in candle_bridge.py and
+ * to the candle receivers' failsafe. Same look, three different paths to it:
+ * the bridge idles on a transport stop or five seconds of MIDI silence, and
+ * these fire when the bridge or the transmitter is gone entirely — the one
+ * case the bridge cannot cover. Retune the palette and these want retuning.
+ */
+/*
+ * FADE CURVE.
+ *
+ * The crossfade is a straight line in LIGHT, but the eye responds roughly to
+ * the 1/2.2 power of light. A linear-in-light ramp therefore looks like it
+ * rushes to nearly full in the first half and then crawls — which reads as a
+ * pop in the middle, and gets worse the longer the fade.
+ *
+ * In theory raising the blend to 2.2 cancels that. In practice it made things
+ * worse on this rig, so the default is 1.0 — linear, as it was. The knob is
+ * here to test both directions:
+ *
+ *   1.0   linear in light, original behaviour
+ *   2.2   perceptual, back-loaded — slow start, arrives at the end
+ *   0.45  the opposite, even more front-loaded than linear
+ *
+ * If neither shape helps, the problem is not the ramp and the knob is a
+ * dead end. Leave it at 1.0.
+ */
+#define FADE_CURVE 1.0
+
+#define FAILSAFE_HUE      56
+#define FAILSAFE_SAT     133
+#define FAILSAFE_BOOST    14
+
 // Same green trim as the candles. Drop toward 0.80 if warm tones read
 // yellow-green on the par.
-float greenTrim = 0.88;
+float greenTrim = 0.897;
 
 /*
  * WARM WHITE SYNTHESIS.
@@ -115,7 +149,7 @@ float greenTrim = 0.88;
  */
 // Tuned by eye against a lit candelabra. The white die turned out to be far
 // less dominant than expected — it wants a bit over half, not a fraction.
-float whiteW = 0.621;    // cool white die share
+float whiteW = 0.603;    // cool white die share
 float whiteA = 0.974;    // amber share
 
 /*
@@ -131,7 +165,7 @@ float whiteA = 0.974;    // amber share
  * trimColour at sat 255, and anything between blends. Scales CH1 only —
  * colour ratios are untouched either way.
  */
-float trimFlame  = 0.293;    // candle flame — the par is far louder than
+float trimFlame  = 0.241;    // candle flame — the par is far louder than
                              // twelve pixels and needs pulling right down
 float trimColour = 1.000;    // saturated palettes — left alone deliberately
 
@@ -153,7 +187,43 @@ float trimColour = 1.000;    // saturated palettes — left alone deliberately
  *
  * Colour is untouched. This is purely the level channel.
  */
-float dimGamma = 0.469;
+float dimGamma = 0.710;
+
+/*
+ * HOW MUCH AMBER FOLLOWS BOOST.
+ *
+ * Boost pushes every emitter toward full, which is what makes C8 and high-CC
+ * 15 looks the brightest the fixture can be. But amber at full is amber, and
+ * a "full white" that arrives tinted is not white.
+ *
+ * On a candle this problem does not exist: boost lights R, G, B and a warm
+ * white die, and there is no amber to run away with it.
+ *
+ *   1.00  amber boosts like everything else — warm, and tinted at the top
+ *   0.30  amber holds back as boost rises, so white stays white
+ *   0.00  amber drops out of boost entirely, coldest whites
+ */
+float boostAmber = 0.30;
+
+/*
+ * TRIM CURVE.
+ *
+ * trimFlame and trimColour are interpolated by saturation, which worked when
+ * the flame sat at 0 and every colour sat near 255. The tuned flame is now
+ * sat 133 — right in the middle — so a linear blend can no longer tell the
+ * two apart, and pulling trimColour down far enough to tame the flame drags
+ * every saturated palette down with it.
+ *
+ * This bends the blend:  trim = tf + (tc - tf) * pow(sat, trimCurve)
+ *
+ *   1.0   linear, as before
+ *   3.0   flame keeps trimFlame well past sat 133, colours still reach tc
+ *   0.5   the opposite, colours reached sooner
+ *
+ * Raise this and trimColour can go back to 1.000, which is where it belongs
+ * if the saturated palettes are not meant to be trimmed at all.
+ */
+float trimCurve = 1.000;
 
 // Channel offsets within a par's 10-slot personality
 enum { CH_DIM = 0, CH_R, CH_G, CH_B, CH_W, CH_A, CH_UV, CH_STROBE, CH_MODE, CH_SPEED };
@@ -192,9 +262,9 @@ struct Par {
   uint8_t speed      = FAILSAFE_SPEED;
   uint8_t depth      = FAILSAFE_DEPTH;
   uint8_t warmth     = FAILSAFE_WARMTH;
-  uint8_t hue        = 0;
-  uint8_t sat        = 0;
-  uint8_t boost      = 0;
+  uint8_t hue        = FAILSAFE_HUE;
+  uint8_t sat        = FAILSAFE_SAT;
+  uint8_t boost      = FAILSAFE_BOOST;
 
   unsigned long fadeStart = 0;
   unsigned long fadeLen   = 0;
@@ -205,6 +275,12 @@ struct Par {
   float         gustDepth = 0;
   unsigned long lastStep  = 0;
   unsigned long phaseOff  = 0;
+
+  // The brightness actually emitted last frame, and the value a crossfade
+  // starts from. A fade must begin where the output IS, not where the
+  // outgoing preset's envelope happens to be sitting.
+  float         lastB     = 0;
+  float         fadeFrom  = 0;
 };
 
 Par pr[NUM_PARS];
@@ -304,10 +380,13 @@ static void flameDmx(const Par& c, float bright, float w, uint8_t* slot) {
     Gout += (1.0 - Gout) * k;
     Bout += (1.0 - Bout) * k;
     W    += (1.0 - W   ) * k;
-    A    += (1.0 - A   ) * k;   // amber included, or boost would go cold
+    // Amber joins in, but on its own leash — enough that boost does not go
+    // cold, not so much that full white comes out orange.
+    A    += (1.0 - A   ) * k * boostAmber;
   }
 
-  float trim  = trimFlame + (trimColour - trimFlame) * s;
+  float sCurve = (trimCurve == 1.0f) ? s : powf(s, trimCurve);
+  float trim  = trimFlame + (trimColour - trimFlame) * sCurve;
   float level = constrain(scl * trim, 0.0f, 1.0f);
   if (dimGamma != 1.0f && level > 0.0f) level = powf(level, dimGamma);
   slot[CH_DIM]    = (uint8_t)constrain(level * 255.0, 0.0f, 255.0f);
@@ -431,6 +510,10 @@ static void applyPacket(const CandlePacket& p, uint8_t mask) {
     c.boost  = p.boost;
 
     if (p.preset != c.preset && p.preset < P_COUNT) {
+      // Catch the fade where the output actually is. Interrupt a slow fade-in
+      // with a short note and the old code would restart from the outgoing
+      // preset at full — a jump to peak before the fade out even began.
+      c.fadeFrom   = c.lastB;
       c.prevPreset = c.preset;
       c.preset     = p.preset;
       c.fadeLen    = (unsigned long)p.fade * 10;
@@ -454,7 +537,7 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
 
   // Trim codes set a variable and stop here — they address no par and emit
   // no light, so they are safe to send while a look is running.
-  if (p.fixture >= 90 && p.fixture <= 95) {
+  if (p.fixture >= 90 && p.fixture <= 97) {
     float v = p.master / 255.0;
     switch (p.fixture) {
       case 90: whiteW    = v; break;
@@ -463,6 +546,8 @@ void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
       case 93: trimFlame  = v; break;
       case 94: trimColour = v; break;
       case 95: dimGamma   = (v < 0.05f) ? 0.05f : v; break;
+      case 96: boostAmber = v; break;
+      case 97: trimCurve  = 0.5f + v * 3.5f; break;   // 0-255 -> 0.5-4.0
     }
     tuneDirty = true;
     return;
@@ -512,10 +597,10 @@ void setup() {
   for (int i = 0; i < NUM_PARS; i++) { Serial.print(" A"); Serial.print(PAR_ADDR[i]); }
   Serial.println();
   Serial.print("my MAC: "); Serial.println(WiFi.macAddress());
-  Serial.println("tuning: ww / wa / gt / tf / tc / dg <0-1>, or ?");
-  Serial.println("over the air: F90 ww F91 wa F92 gt F93 tf F94 tc F95 dg");
-  Serial.printf("ww %.3f  wa %.3f  gt %.3f  tf %.3f  tc %.3f  dg %.3f\n",
-                whiteW, whiteA, greenTrim, trimFlame, trimColour, dimGamma);
+  Serial.println("tuning: ww wa gt tf tc dg ba tk, or ?");
+  Serial.println("air: F90 ww F91 wa F92 gt F93 tf F94 tc F95 dg F96 ba F97 tk");
+  Serial.printf("ww %.3f wa %.3f gt %.3f tf %.3f tc %.3f dg %.3f ba %.3f tk %.3f\n",
+                whiteW, whiteA, greenTrim, trimFlame, trimColour, dimGamma, boostAmber, trimCurve);
 }
 
 // ---------------------------------------------------------------- tuning
@@ -531,6 +616,8 @@ void setup() {
  *   tf 0.30     flame trim on CH1    lower = dimmer candle look
  *   tc 1.00     colour trim on CH1   lower = dimmer saturated looks
  *   dg 1.00     dimmer curve on CH1  lower = lifts the low end
+ *   ba 0.30     amber share of boost  lower = whiter at high boost
+ *   tk 1.00     trim curve, 0.5-4.0   higher = flame keeps tf further up
  *   ?           print the current values
  */
 static void tuneLine(String ln) {
@@ -538,17 +625,17 @@ static void tuneLine(String ln) {
   if (ln.length() == 0) return;
 
   if (ln == "?") {
-    Serial.printf("ww %.3f  wa %.3f  gt %.3f  tf %.3f  tc %.3f  dg %.3f\n",
-                  whiteW, whiteA, greenTrim, trimFlame, trimColour, dimGamma);
+    Serial.printf("ww %.3f wa %.3f gt %.3f tf %.3f tc %.3f dg %.3f ba %.3f tk %.3f\n",
+                  whiteW, whiteA, greenTrim, trimFlame, trimColour, dimGamma, boostAmber, trimCurve);
     return;
   }
 
   int sp = ln.indexOf(' ');
-  if (sp < 0) { Serial.println("? for values, or: ww / wa / gt / tf / tc / dg <0-1>"); return; }
+  if (sp < 0) { Serial.println("? for values, or: ww wa gt tf tc dg ba tk"); return; }
 
   String key = ln.substring(0, sp);
   float  v   = ln.substring(sp + 1).toFloat();
-  v = constrain(v, 0.0f, 2.0f);
+  v = constrain(v, 0.0f, 4.0f);
 
   if      (key == "ww") whiteW    = v;
   else if (key == "wa") whiteA    = v;
@@ -556,10 +643,12 @@ static void tuneLine(String ln) {
   else if (key == "tf") trimFlame  = v;
   else if (key == "tc") trimColour = v;
   else if (key == "dg") dimGamma   = (v < 0.05f) ? 0.05f : v;
-  else { Serial.println("unknown. try: ww / wa / gt / tf / tc / dg <0-1>, or ?"); return; }
+  else if (key == "ba") boostAmber = v;
+  else if (key == "tk") trimCurve  = (v < 0.1f) ? 0.1f : v;
+  else { Serial.println("unknown. try: ww wa gt tf tc dg ba tk, or ?"); return; }
 
-  Serial.printf("ww %.3f  wa %.3f  gt %.3f  tf %.3f  tc %.3f  dg %.3f\n",
-                whiteW, whiteA, greenTrim, trimFlame, trimColour, dimGamma);
+  Serial.printf("ww %.3f wa %.3f gt %.3f tf %.3f tc %.3f dg %.3f ba %.3f tk %.3f\n",
+                whiteW, whiteA, greenTrim, trimFlame, trimColour, dimGamma, boostAmber, trimCurve);
 }
 
 // ---------------------------------------------------------------- loop
@@ -569,8 +658,8 @@ void loop() {
 
   if (tuneDirty) {
     tuneDirty = false;
-    Serial.printf("ww %.3f  wa %.3f  gt %.3f  tf %.3f  tc %.3f  dg %.3f  (air)\n",
-                  whiteW, whiteA, greenTrim, trimFlame, trimColour, dimGamma);
+    Serial.printf("ww %.3f wa %.3f gt %.3f tf %.3f tc %.3f dg %.3f ba %.3f tk %.3f (air)\n",
+                  whiteW, whiteA, greenTrim, trimFlame, trimColour, dimGamma, boostAmber, trimCurve);
   }
 
   while (Serial.available()) {
@@ -591,7 +680,8 @@ void loop() {
   if (lastRx != 0 && now - lastRx > FAILSAFE_MS && !inFailsafe) {
     inFailsafe = true;
     CandlePacket idle = { MAGIC, 0, P_GUST, FAILSAFE_MASTER, FAILSAFE_SPEED,
-                          FAILSAFE_DEPTH, FAILSAFE_WARMTH, 100, 0, 0, 0 };
+                          FAILSAFE_DEPTH, FAILSAFE_WARMTH, 100,
+                          FAILSAFE_HUE, FAILSAFE_SAT, FAILSAFE_BOOST };
     applyPacket(idle, ALL_PARS);
   }
 
@@ -606,14 +696,15 @@ void loop() {
         c.fadeLen = 0;
       } else {
         float blend = (float)elapsed / (float)c.fadeLen;
-        // Evaluate the outgoing preset on a scratch copy, or the random walk
-        // advances twice per frame and the flicker doubles in speed.
-        Par tmp = c;
-        float prev = renderPar(tmp, c.prevPreset);
-        b = prev * (1.0 - blend) + b * blend;
+        blend = powf(blend, FADE_CURVE);
+        // From where the output was, to the incoming preset live. No need to
+        // re-render the outgoing one, which also means no scratch copy and no
+        // risk of advancing a random walk twice in a frame.
+        b = c.fadeFrom * (1.0 - blend) + b * blend;
       }
     }
 
+    c.lastB = b;
     float w = (c.warmth / 255.0) * (1.0 - b * 0.35) + (1.0 - b) * 0.2;
     flameDmx(c, b, w, &dmxData[PAR_ADDR[i]]);
   }
